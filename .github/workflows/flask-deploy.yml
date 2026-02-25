@@ -1,4 +1,4 @@
-name: Next.js Deploy to VPS
+name: Flask Deploy to VPS
 
 on:
   workflow_call:
@@ -16,41 +16,21 @@ on:
         required: false
         type: string
         default: "/"
-      node_options:
-        description: "ビルド時のNODE_OPTIONS"
+      python_version:
+        description: "Pythonバージョン"
         required: false
         type: string
-        default: ""
-      needs_gh_packages:
-        description: "GitHub Packages認証が必要か"
-        required: false
-        type: boolean
-        default: false
+        default: "3.11"
       env_setup_script:
         description: "VPS上の.envセットアップスクリプト"
         required: false
         type: string
         default: ""
-      seed_command:
-        description: "シードコマンド（空ならスキップ）"
+      db_path:
+        description: "DBファイルの相対パス（空ならDBバックアップスキップ）"
         required: false
         type: string
         default: ""
-      ci_database_url:
-        description: "CI用DATABASE_URL"
-        required: false
-        type: string
-        default: "file:./prisma/ci.db"
-      ci_run_migrate:
-        description: "CIでマイグレーション実行するか"
-        required: false
-        type: boolean
-        default: true
-      migrate_timing:
-        description: "VPSマイグレーションタイミング（before_build / after_build）"
-        required: false
-        type: string
-        default: "before_build"
     secrets:
       VPS_HOST:
         required: true
@@ -60,54 +40,32 @@ on:
         required: true
       VPS_PORT:
         required: true
-      GH_PACKAGES_TOKEN:
-        required: false
 
 jobs:
-  # ステップ1: GitHub Actions上でビルドテスト（VPSに触らずに検証）
+  # ステップ1: GitHub Actions上でテスト（VPSに触らずに検証）
   build-check:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          node-version: "20"
-          cache: "npm"
-          registry-url: ${{ inputs.needs_gh_packages && 'https://npm.pkg.github.com' || '' }}
+          python-version: ${{ inputs.python_version }}
+          cache: "pip"
 
       - name: Install dependencies
-        run: npm ci --production=false
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest -v
         env:
-          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+          FLASK_ENV: testing
 
-      - name: Generate Prisma client
-        run: npx prisma generate
-
-      - name: Setup CI database
-        if: inputs.ci_run_migrate
-        run: npx prisma migrate deploy
-        env:
-          DATABASE_URL: ${{ inputs.ci_database_url }}
-
-      - name: TypeScript type check
-        run: npx tsc --noEmit
-
-      - name: Build Next.js
-        run: npm run build
-        env:
-          DATABASE_URL: ${{ inputs.ci_database_url }}
-
-  # ステップ2: ビルドテスト成功後にVPSへデプロイ
+  # ステップ2: テスト成功後にVPSへデプロイ
   deploy:
     runs-on: ubuntu-latest
     needs: build-check
-    env:
-      GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
     steps:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
@@ -117,17 +75,13 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT }}
           command_timeout: 10m
-          envs: GH_PACKAGES_TOKEN
           script: |
             set -e
             APP_NAME="${{ inputs.app_name }}"
             APP_DIR="/var/www/$APP_NAME"
             PORT="${{ inputs.port }}"
             HEALTH_PATH="${{ inputs.health_check_path }}"
-            NODE_OPTS="${{ inputs.node_options }}"
-            NEEDS_GH_PACKAGES="${{ inputs.needs_gh_packages }}"
-            SEED_CMD="${{ inputs.seed_command }}"
-            MIGRATE_TIMING="${{ inputs.migrate_timing }}"
+            DB_PATH="${{ inputs.db_path }}"
 
             cd "$APP_DIR"
 
@@ -146,14 +100,11 @@ jobs:
             fi
 
             # --- バックアップ作成 ---
-            echo ">>> 旧ビルドをバックアップ中..."
+            echo ">>> バックアップ中..."
             BACKUP_DIR="$APP_DIR/.deploy-backup"
             rm -rf "$BACKUP_DIR"
             mkdir -p "$BACKUP_DIR"
 
-            if [ -d ".next" ]; then
-              cp -a .next "$BACKUP_DIR/.next"
-            fi
             git rev-parse HEAD > "$BACKUP_DIR/git-head.txt"
             echo ">>> バックアップ完了: $(cat $BACKUP_DIR/git-head.txt)"
 
@@ -175,28 +126,17 @@ jobs:
                 git checkout "$PREV_HEAD" -- . 2>/dev/null || true
               fi
 
-              if [ -d "$BACKUP_DIR/.next" ]; then
-                echo ">>> .next を復元中..."
-                rm -rf .next
-                cp -a "$BACKUP_DIR/.next" .next
-              fi
-
               # --- DB 復元 ---
-              if ls /var/backups/sqlite/$APP_NAME/deploy/*.db 1>/dev/null 2>&1; then
+              if [ -n "$DB_PATH" ] && ls /var/backups/sqlite/$APP_NAME/deploy/*.db 1>/dev/null 2>&1; then
                 LATEST_DB_BACKUP=$(ls -t /var/backups/sqlite/$APP_NAME/deploy/*.db | head -1)
                 echo ">>> DB 復元中: $LATEST_DB_BACKUP"
-                DB_URL=$(grep "^DATABASE_URL" "$APP_DIR/.env" 2>/dev/null | sed 's/^DATABASE_URL=//' | sed 's/^[" ]*//' | sed 's/[" ]*$//' | sed 's|^file:\./||' | sed 's|^file:||')
-                if [ -n "$DB_URL" ]; then
-                  pm2 stop "$APP_NAME" 2>/dev/null || true
-                  cp "$LATEST_DB_BACKUP" "$APP_DIR/$DB_URL"
-                  echo ">>> DB 復元完了"
-                else
-                  echo ">>> DB パス解決失敗（復元スキップ）"
-                fi
+                pm2 stop "$APP_NAME" 2>/dev/null || true
+                cp "$LATEST_DB_BACKUP" "$APP_DIR/$DB_PATH"
+                echo ">>> DB 復元完了"
               fi
 
               echo ">>> PM2 を旧バージョンで再起動..."
-              pm2 startOrRestart ecosystem.config.cjs --env production 2>/dev/null || true
+              pm2 startOrRestart ecosystem.config.cjs 2>/dev/null || true
               sleep 5
               echo ">>> ロールバック完了"
               pm2 status
@@ -205,58 +145,29 @@ jobs:
 
             # --- コード取得 ---
             echo ">>> git pull..."
+            git checkout -- . 2>/dev/null || true
             git pull origin main || rollback
 
-            # --- GitHub Packages認証 ---
-            if [ "$NEEDS_GH_PACKAGES" = "true" ]; then
-              echo ">>> GitHub Packages認証を設定..."
-              echo "//npm.pkg.github.com/:_authToken=${GH_PACKAGES_TOKEN}" > ~/.npmrc
-              echo "@ryohta-oku:registry=https://npm.pkg.github.com" >> ~/.npmrc
+            # --- Python仮想環境 ---
+            echo ">>> venv セットアップ..."
+            if [ ! -d "venv" ]; then
+              python3 -m venv venv
             fi
+            source venv/bin/activate
 
             # --- 依存パッケージ ---
-            echo ">>> npm ci..."
-            npm ci --production=false || rollback
+            echo ">>> pip install..."
+            pip install -r requirements.txt || rollback
 
-            # --- Prisma ---
-            echo ">>> Prisma generate..."
-            npx prisma generate || rollback
-
-            # --- マイグレーション（ビルド前） ---
-            if [ "$MIGRATE_TIMING" = "before_build" ]; then
-              echo ">>> Prisma migrate deploy（ビルド前）..."
-              npx prisma migrate deploy || rollback
-            fi
-
-            # --- ビルド ---
-            echo ">>> npm run build..."
-            if [ -n "$NODE_OPTS" ]; then
-              NODE_OPTIONS="$NODE_OPTS" npm run build || rollback
-            else
-              npm run build || rollback
-            fi
-
-            if [ ! -d ".next" ]; then
-              echo "エラー: .next ディレクトリが見つかりません"
-              rollback
-            fi
-            echo ">>> ビルド成功"
-
-            # --- マイグレーション（ビルド後） ---
-            if [ "$MIGRATE_TIMING" = "after_build" ]; then
-              echo ">>> Prisma migrate deploy（ビルド後）..."
-              npx prisma migrate deploy || rollback
-            fi
-
-            # --- シード ---
-            if [ -n "$SEED_CMD" ]; then
-              echo ">>> シード実行中..."
-              eval "$SEED_CMD"
+            # --- データディレクトリ ---
+            if [ -n "$DB_PATH" ]; then
+              DB_DIR=$(dirname "$DB_PATH")
+              mkdir -p "$DB_DIR"
             fi
 
             # --- PM2再起動 ---
             echo ">>> PM2 restart..."
-            pm2 startOrRestart ecosystem.config.cjs --env production || rollback
+            pm2 startOrRestart ecosystem.config.cjs || rollback
 
             # --- ヘルスチェック ---
             echo ">>> ヘルスチェック中（最大30秒）..."
