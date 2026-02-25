@@ -1,0 +1,267 @@
+name: Next.js Deploy to VPS
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: "アプリ名（PM2名 & /var/www/ディレクトリ名）"
+        required: true
+        type: string
+      port:
+        description: "ヘルスチェック用ポート"
+        required: true
+        type: number
+      health_check_path:
+        description: "ヘルスチェックのパス"
+        required: false
+        type: string
+        default: "/"
+      node_options:
+        description: "ビルド時のNODE_OPTIONS"
+        required: false
+        type: string
+        default: ""
+      needs_gh_packages:
+        description: "GitHub Packages認証が必要か"
+        required: false
+        type: boolean
+        default: false
+      env_setup_script:
+        description: "VPS上の.envセットアップスクリプト"
+        required: false
+        type: string
+        default: ""
+      seed_command:
+        description: "シードコマンド（空ならスキップ）"
+        required: false
+        type: string
+        default: ""
+      ci_database_url:
+        description: "CI用DATABASE_URL"
+        required: false
+        type: string
+        default: "file:./prisma/ci.db"
+      ci_run_migrate:
+        description: "CIでマイグレーション実行するか"
+        required: false
+        type: boolean
+        default: true
+      migrate_timing:
+        description: "VPSマイグレーションタイミング（before_build / after_build）"
+        required: false
+        type: string
+        default: "before_build"
+    secrets:
+      VPS_HOST:
+        required: true
+      VPS_USER:
+        required: true
+      VPS_SSH_KEY:
+        required: true
+      VPS_PORT:
+        required: true
+      GH_PACKAGES_TOKEN:
+        required: false
+
+jobs:
+  # ステップ1: GitHub Actions上でビルドテスト（VPSに触らずに検証）
+  build-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          registry-url: ${{ inputs.needs_gh_packages && 'https://npm.pkg.github.com' || '' }}
+
+      - name: Install dependencies
+        run: npm ci --production=false
+        env:
+          GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Setup CI database
+        if: inputs.ci_run_migrate
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: ${{ inputs.ci_database_url }}
+
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+      - name: Build Next.js
+        run: npm run build
+        env:
+          DATABASE_URL: ${{ inputs.ci_database_url }}
+
+  # ステップ2: ビルドテスト成功後にVPSへデプロイ
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-check
+    env:
+      GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          command_timeout: 10m
+          envs: GH_PACKAGES_TOKEN
+          script: |
+            set -e
+            APP_NAME="${{ inputs.app_name }}"
+            APP_DIR="/var/www/$APP_NAME"
+            PORT="${{ inputs.port }}"
+            HEALTH_PATH="${{ inputs.health_check_path }}"
+            NODE_OPTS="${{ inputs.node_options }}"
+            NEEDS_GH_PACKAGES="${{ inputs.needs_gh_packages }}"
+            SEED_CMD="${{ inputs.seed_command }}"
+            MIGRATE_TIMING="${{ inputs.migrate_timing }}"
+
+            cd "$APP_DIR"
+
+            echo "=== デプロイ開始: $APP_NAME ==="
+
+            # --- .env セットアップ ---
+            ENV_SETUP_SCRIPT=$(cat << 'ENVSETUP'
+            ${{ inputs.env_setup_script }}
+            ENVSETUP
+            )
+            if [ -n "$ENV_SETUP_SCRIPT" ]; then
+              echo ">>> .env セットアップ実行中..."
+              eval "$ENV_SETUP_SCRIPT"
+              echo ">>> .env キー一覧:"
+              grep -E "^[A-Z_]+=" "$APP_DIR/.env" | sed 's/=.*/=***/' || true
+            fi
+
+            # --- バックアップ作成 ---
+            echo ">>> 旧ビルドをバックアップ中..."
+            BACKUP_DIR="$APP_DIR/.deploy-backup"
+            rm -rf "$BACKUP_DIR"
+            mkdir -p "$BACKUP_DIR"
+
+            if [ -d ".next" ]; then
+              cp -a .next "$BACKUP_DIR/.next"
+            fi
+            git rev-parse HEAD > "$BACKUP_DIR/git-head.txt"
+            echo ">>> バックアップ完了: $(cat $BACKUP_DIR/git-head.txt)"
+
+            # --- ロールバック関数 ---
+            rollback() {
+              echo "!!! デプロイ失敗 - ロールバック開始 !!!"
+
+              if [ -f "$BACKUP_DIR/git-head.txt" ]; then
+                PREV_HEAD=$(cat "$BACKUP_DIR/git-head.txt")
+                echo ">>> git checkout $PREV_HEAD..."
+                git checkout "$PREV_HEAD" -- . 2>/dev/null || true
+              fi
+
+              if [ -d "$BACKUP_DIR/.next" ]; then
+                echo ">>> .next を復元中..."
+                rm -rf .next
+                cp -a "$BACKUP_DIR/.next" .next
+              fi
+
+              echo ">>> PM2 を旧バージョンで再起動..."
+              pm2 startOrRestart ecosystem.config.cjs --env production 2>/dev/null || true
+              sleep 5
+              echo ">>> ロールバック完了"
+              pm2 status
+              exit 1
+            }
+
+            # --- コード取得 ---
+            echo ">>> git pull..."
+            git pull origin main || rollback
+
+            # --- GitHub Packages認証 ---
+            if [ "$NEEDS_GH_PACKAGES" = "true" ]; then
+              echo ">>> GitHub Packages認証を設定..."
+              echo "//npm.pkg.github.com/:_authToken=${GH_PACKAGES_TOKEN}" > ~/.npmrc
+              echo "@ryohta-oku:registry=https://npm.pkg.github.com" >> ~/.npmrc
+            fi
+
+            # --- 依存パッケージ ---
+            echo ">>> npm ci..."
+            npm ci --production=false || rollback
+
+            # --- Prisma ---
+            echo ">>> Prisma generate..."
+            npx prisma generate || rollback
+
+            # --- マイグレーション（ビルド前） ---
+            if [ "$MIGRATE_TIMING" = "before_build" ]; then
+              echo ">>> Prisma migrate deploy（ビルド前）..."
+              npx prisma migrate deploy || rollback
+            fi
+
+            # --- ビルド ---
+            echo ">>> npm run build..."
+            if [ -n "$NODE_OPTS" ]; then
+              NODE_OPTIONS="$NODE_OPTS" npm run build || rollback
+            else
+              npm run build || rollback
+            fi
+
+            if [ ! -d ".next" ]; then
+              echo "エラー: .next ディレクトリが見つかりません"
+              rollback
+            fi
+            echo ">>> ビルド成功"
+
+            # --- マイグレーション（ビルド後） ---
+            if [ "$MIGRATE_TIMING" = "after_build" ]; then
+              echo ">>> Prisma migrate deploy（ビルド後）..."
+              npx prisma migrate deploy || rollback
+            fi
+
+            # --- シード ---
+            if [ -n "$SEED_CMD" ]; then
+              echo ">>> シード実行中..."
+              eval "$SEED_CMD"
+            fi
+
+            # --- PM2再起動 ---
+            echo ">>> PM2 restart..."
+            pm2 startOrRestart ecosystem.config.cjs --env production || rollback
+
+            # --- ヘルスチェック ---
+            echo ">>> ヘルスチェック中（最大30秒）..."
+            HEALTH_OK=false
+            for i in $(seq 1 6); do
+              sleep 5
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${PORT}${HEALTH_PATH}" 2>/dev/null || echo "000")
+              echo ">>> 試行 $i/6: HTTP $HTTP_CODE"
+              if [ "$HTTP_CODE" = "200" ]; then
+                HEALTH_OK=true
+                break
+              fi
+            done
+
+            if [ "$HEALTH_OK" = false ]; then
+              echo "!!! ヘルスチェック失敗（HTTP応答なし）"
+              echo ">>> PM2 ログ:"
+              pm2 logs "$APP_NAME" --nostream --lines 30
+              rollback
+            fi
+
+            echo ">>> ヘルスチェック成功"
+
+            # --- 完了 ---
+            echo ">>> PM2 status:"
+            pm2 status
+            echo ">>> PM2 logs (最新10行):"
+            pm2 logs "$APP_NAME" --nostream --lines 10
+
+            echo "=== デプロイ完了（正常）: $APP_NAME ==="
