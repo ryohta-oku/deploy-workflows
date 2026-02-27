@@ -86,11 +86,21 @@ jobs:
           GH_PACKAGES_TOKEN: ${{ secrets.GH_PACKAGES_TOKEN }}
 
       - name: Generate Prisma client
-        run: npx prisma generate
+        run: |
+          if [ -f prisma/prisma.config.ts ]; then
+            npx prisma generate --config prisma/prisma.config.ts
+          else
+            npx prisma generate
+          fi
 
       - name: Setup CI database
         if: inputs.ci_run_migrate
-        run: npx prisma migrate deploy
+        run: |
+          if [ -f prisma/prisma.config.ts ]; then
+            npx prisma migrate deploy --config prisma/prisma.config.ts
+          else
+            npx prisma migrate deploy
+          fi
         env:
           DATABASE_URL: ${{ inputs.ci_database_url }}
 
@@ -220,12 +230,20 @@ jobs:
 
             # --- Prisma ---
             echo ">>> Prisma generate..."
-            npx prisma generate || rollback
+            if [ -f prisma/prisma.config.ts ]; then
+              npx prisma generate --config prisma/prisma.config.ts || rollback
+            else
+              npx prisma generate || rollback
+            fi
 
             # --- マイグレーション（ビルド前） ---
             if [ "$MIGRATE_TIMING" = "before_build" ]; then
               echo ">>> Prisma migrate deploy（ビルド前）..."
-              npx prisma migrate deploy || rollback
+              if [ -f prisma/prisma.config.ts ]; then
+                npx prisma migrate deploy --config prisma/prisma.config.ts || rollback
+              else
+                npx prisma migrate deploy || rollback
+              fi
             fi
 
             # --- ビルド ---
@@ -245,7 +263,11 @@ jobs:
             # --- マイグレーション（ビルド後） ---
             if [ "$MIGRATE_TIMING" = "after_build" ]; then
               echo ">>> Prisma migrate deploy（ビルド後）..."
-              npx prisma migrate deploy || rollback
+              if [ -f prisma/prisma.config.ts ]; then
+                npx prisma migrate deploy --config prisma/prisma.config.ts || rollback
+              else
+                npx prisma migrate deploy || rollback
+              fi
             fi
 
             # --- シード ---
